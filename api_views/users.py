@@ -81,7 +81,7 @@ def login_user():
             return Response(json.dumps(responseObject), 200, mimetype="application/json")
         if vuln:  # Password Enumeration
             if user and request_data.get('password') != user.password:
-                return Response(error_message_helper("Password is not correct for the given username."), 200, mimetype="application/json")
+                return Response(error_message_helper("Password is not correct for the given username.Week2 Completed"), 200, mimetype="application/json")
             elif not user:  # User enumeration
                 return Response(error_message_helper("Username does not exist"), 200, mimetype="application/json")
         else:

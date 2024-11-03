@@ -1,0 +1,254 @@
+name: Python test and build
+
+on: [push]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Test with pytest
+        run: |
+          pip install pytest pytest-cov
+          pytest api_tests.py --doctest-modules --junitxml=junit/test-results.xml --cov=com --cov-report=xml --cov-report=html
+      - name: Archive code coverage results
+        uses: actions/upload-artifact@v4
+        id: artifact-upload-step
+        with:
+          name: test-results
+          path: junit/test-results.xml
+  image-scan:
+    needs: [test]
+    if: true
+    runs-on: ubuntu-latest
+    steps:
+        - name: Scan image
+          uses: anchore/scan-action@v3
+          id: image-scan
+          with:
+            image: ${{ secrets.DOCKERHUB_USERNAME }}/devops-labs
+            fail-build: false
+            output-format: json
+        - name: Upload Image report
+          id: upload-image-report
+          uses: actions/upload-artifact@v4
+          with:
+            name: image-report
+            path: ${{ steps.image-scan.outputs.json }}
+  sonarqube:
+    needs: test
+    if: true
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        # Disabling shallow clones is recommended for improving the relevancy of reporting
+        fetch-depth: 0
+    - name: SonarQube Scan
+      uses: sonarsource/sonarqube-scan-action@master
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_URL }}
+    - name: Download SonarQube report
+      run: |
+           sleep 30
+           URL="${{ secrets.SONAR_URL }}/api/qualitygates/project_status?p=1&projectKey=devsecops-app&branch=main"
+           echo "Report URL $URL"
+           curl -u ${{ secrets.SONAR_TOKEN }}: "$URL" -o sonarqube-report.json
+    - name: Upload SonarQube report
+      id: artifact-sonarqube
+      uses: actions/upload-artifact@v4
+      with:
+       name: sonarqube-report
+       path: sonarqube-report.json
+  dast:
+    needs: test
+    if: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      -
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      -
+        name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/devops-labs:dast-test
+      - uses: azure/login@v1
+        with:
+            creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+      - name: Deploy DAST Container App
+        uses: azure/container-apps-deploy-action@v1
+        with:
+            imageToDeploy: ${{ secrets.DOCKERHUB_USERNAME }}/devops-labs:dast-test
+            containerAppName: devops-test-app
+            containerAppEnvironment: devops-app-env
+            resourceGroup: devsecops-lab
+            location: australiaeast
+            targetPort: 5000  
+      - name: Get deployed DAST app url
+        run: |
+              export FQDN=$(az containerapp show -n devops-test-app -g devsecops-lab --query properties.configuration.ingress.fqdn -o tsv)
+              echo "TEST_APP_URL=https://$FQDN" >> $GITHUB_ENV
+              echo "TEST_APP_URL=https://$FQDN" 
+              curl https://$FQDN/ui
+              sed -i "s,http://localhost:5000,https://$FQDN,g" $GITHUB_WORKSPACE/openapi_specs/openapi3.yml
+      - name: ZAP Scan
+        uses: zaproxy/action-api-scan@v0.6.0
+        with:
+                token: ${{ secrets.GITHUB_TOKEN }}
+                docker_name: 'ghcr.io/zaproxy/zaproxy:stable'
+                format: openapi
+                target: /zap/wrk/openapi_specs/openapi3.yml
+                rules_file_name: .zap/rules.tsv
+                cmd_options: '-a -c /zap/wrk/.zap/rules.tsv'
+                fail_action: false
+                allow_issue_writing: false
+            
+      - name: Upload ZAP report
+        id: artifact-zap
+        uses: actions/upload-artifact@v4
+        with:
+                name: zap-report
+                path: report_json.json
+  build:
+                  # needs: [security_gate]
+                  if: true
+                  permissions:
+                    id-token: write
+                  runs-on: ubuntu-latest
+                  steps:
+                    -
+                      name: Set up QEMU
+                      uses: docker/setup-qemu-action@v3
+                    -
+                      name: Set up Docker Buildx
+                      uses: docker/setup-buildx-action@v3
+                    -
+                      name: Login to Docker Hub
+                      uses: docker/login-action@v3
+                      with:
+                        username: ${{ secrets.DOCKERHUB_USERNAME }}
+                        password: ${{ secrets.DOCKERHUB_TOKEN }}
+                    -
+                      name: Build and push
+                      uses: docker/build-push-action@v5
+                      with:
+                        push: true
+                        sbom: true
+                        provenance: true
+                        tags: ${{ secrets.DOCKERHUB_USERNAME }}/devops-labs:latest
+              
+                    - name: Install Cosign
+                      uses: sigstore/cosign-installer@v3.4.0
+              
+                    - name: Sign the images with GitHub OIDC Token
+                      env:
+                        IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/devops-labs:latest
+                      run: |
+                        cosign sign --yes ${IMAGE}
+  security_gate:
+        needs: [sonarqube, dast, image-scan]
+        if: true
+        runs-on: ubuntu-latest
+        steps:
+        - name: Download sonarqube-report
+          uses: actions/download-artifact@v4
+          with:
+            name: sonarqube-report
+            path: ${{github.workspace}}
+        - name: Download zap-report
+          uses: actions/download-artifact@v4
+          with:
+            name: zap-report
+            path: ${{github.workspace}}
+        - name: Download image-report
+          uses: actions/download-artifact@v4
+          with:
+            name: image-report
+            path: ${{github.workspace}}
+        - name: Read reports
+          run: |
+            IMAGE_RESULT_HIGH=$(cat results.json | jq '.matches[] | select(.vulnerability.severity=="High") | .vulnerability.id' | wc -l)
+            if [ $IMAGE_RESULT_HIGH -gt 0 ]; then
+              echo "Image scan has high severity vulnerabilities"
+              exit 1
+            else
+              echo "Image scan passed"
+            fi
+            
+            SONAR_RESULT=$(cat sonarqube-report.json | jq -r '.projectStatus.status')
+            if [ $SONAR_RESULT != "OK" ]; then
+              echo "Sonar scan has issues"
+              exit 1
+            else
+              echo "Sonar scan passed"
+            fi
+            
+            ZAP_RESULT_HIGH=$(cat report_json.json | jq -r '.site[].alerts[] | select(.riskdesc | startswith("High")) | .name' | wc -l)
+            if [ $ZAP_RESULT_HIGH -gt 0 ]; then
+              echo "Zap scan has high severity vulnerabilities"
+              exit 1
+            else
+              echo "Zap scan passed"
+            fi
+            
+            echo "All security gates passed"
+  submit_reports:
+   needs: [sonarqube, dast, image-scan]
+   if: true
+   runs-on: ubuntu-latest
+   steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: sonarqube-report
+        path: ${{github.workspace}}
+    - uses: actions/download-artifact@v4
+      with:
+        name: zap-report
+        path: ${{github.workspace}}
+    - uses: actions/download-artifact@v4
+      with:
+        name: image-report
+        path: ${{github.workspace}}
+    - name: Upload reports
+      env:
+         DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+         AZURE_ACCESS_TOKEN: ${{ steps.token-gen.outputs.azureAccessToken }}
+         IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/devops-labs
+      run: |
+          WEEK1_CONTAINER=$(curl -X POST -H "Authorization: Bearer $AZURE_ACCESS_TOKEN" -d "$DOCKERHUB_USERNAME/devops-labs" https://devsecops-ver.azurewebsites.net/api/week1-container)
+          echo "Week1 container upload: $WEEK1_CONTAINER"
+          
+          SONAR_RESPONSE=$(curl -X POST -H "Authorization: Bearer $AZURE_ACCESS_TOKEN"  --data-binary @$GITHUB_WORKSPACE/sonarqube-report.json https://devsecops-ver.azurewebsites.net/api/week3-sonar-report)
+          echo "Sonar upload: $SONAR_RESPONSE"
+          ZAP_RESPONSE=$(curl -X POST -H "Authorization: Bearer $AZURE_ACCESS_TOKEN"  --data-binary @$GITHUB_WORKSPACE/report_json.json https://devsecops-ver.azurewebsites.net/api/week3-zap-report)
+          echo "Zap upload: $ZAP_RESPONSE"
+          
+          IMAGE_RESPONSE=$(curl -X POST -H "Authorization: Bearer $AZURE_ACCESS_TOKEN" --data-binary @$GITHUB_WORKSPACE/results.json https://devsecops-ver.azurewebsites.net/api/week4-image-report)
+          echo "Image report upload: $IMAGE_RESPONSE"
+          
+          WEEK5_RESPONSE=$(curl -X POST  -H "Authorization: Bearer $AZURE_ACCESS_TOKEN"  -d "$IMAGE" https://devsecops-ver.azurewebsites.net/api/week5-report)
+          echo "Week5 report upload: $WEEK5_RESPONSE"
+          MODEL_RESPONSE=$(curl -X POST -H "Authorization: Bearer $AZURE_ACCESS_TOKEN" --data-binary @$GITHUB_WORKSPACE/threat-model/ci-pipeline.json https://devsecops-ver.azurewebsites.net/api/week6-report)
+          echo "Model report upload: $MODEL_RESPONSE"

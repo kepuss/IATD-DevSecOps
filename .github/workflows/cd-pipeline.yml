@@ -1,0 +1,44 @@
+name: Deploy
+
+on: workflow_dispatch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Install Cosign
+      uses: sigstore/cosign-installer@v3.4.0
+
+    - name: Verify image signature
+      env:
+        IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/devops-labs:latest
+        GITHUB_ISSUER: https://token.actions.githubusercontent.com
+        CERT_IDENTITY_REGEXP: https://github.com/margaritasentuna/IATD-DevSecOps/.github/workflows/ci-pipeline.yml
+      run: |
+        cosign verify $IMAGE  --certificate-identity-regexp $CERT_IDENTITY_REGEXP  --certificate-oidc-issuer $GITHUB_ISSUER
+  submit_results:
+    needs: [deploy]
+    if: true
+    runs-on: ubuntu-latest
+    steps:
+        - uses: azure/login@v1
+          with:
+            creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+        - name: Azure CLI script
+          id: token-gen
+          uses: azure/CLI@v1
+          with:
+             azcliversion: 2.63.0
+             inlineScript: |
+                ACCESS_TOKEN=$(az account get-access-token | jq -r .accessToken)
+                echo "azureAccessToken=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
+        - name: Upload reports
+          env:
+            DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+            AZURE_ACCESS_TOKEN: ${{ steps.token-gen.outputs.azureAccessToken }}
+          run: |
+              export FQDN=$(az containerapp show -n devops-app -g devsecops-lab --query properties.configuration.ingress.fqdn -o tsv)
+              echo "FQDN: $FQDN"
+              WEEK2_SUBMIT=$(curl -X POST -H "Authorization: Bearer $AZURE_ACCESS_TOKEN" -d "https://$FQDN" https://devsecops-ver.azurewebsites.net/api/week2-submit)
+              echo "Week2 submit: $WEEK2_SUBMIT"
